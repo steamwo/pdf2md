@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PDF inputs and generated artifacts
+*.pdf
+out*.md
+assets*/
+clean/
