@@ -82,6 +82,21 @@ KEEP_SOURCE_IMAGE = True
 | `convert.py` | PDF 页面分析、表格/代码/标题恢复、Markdown 输出 |
 | `mermaid_diagram.py` | 矢量时序图/流程图 → Mermaid，含置信度校验与回退 |
 | `requirements.txt` | Python 依赖 |
+| `tools/` | 字体、代码块、表格网格等诊断脚本，详见 `tools/README.md` |
+
+## 诊断工具
+
+`work` 目录中的排查脚本已整理到 `tools/`：
+
+- `pdf_inspect.py`：元数据、前几页文本/图片块
+- `scan_fonts.py`：字体/字号/颜色统计
+- `scan_code.py`：代码块容器与内容抽样
+- `analyze.py`：水印、等宽字体页面统计
+- `inspect_grid.py`：表格横竖线与单元格坐标
+- `inspect_tables.py`：`find_tables()` 结果对比
+
+用法见 `tools/README.md`。
+
 
 ## 已知限制
 
