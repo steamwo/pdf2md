@@ -3,7 +3,7 @@
 
 Usage: python convert.py <input.pdf> <output.md> <assets_dir> <asset_prefix>
 """
-import sys, os, re, json, statistics
+import sys, os, re, json, statistics, time, shutil, tempfile
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -12,7 +12,8 @@ import pymupdf
 import mermaid_diagram
 
 # 是否在 Mermaid 代码块后附带可折叠的原图（便于核对保真度）
-KEEP_SOURCE_IMAGE = True
+# False 时只保留语义化结果，且不为已转成功的图渲染 PNG
+KEEP_SOURCE_IMAGE = False
 DIAGRAM_LABELS = {"sequence": "时序图", "flowchart": "流程图"}
 
 # ---------------------------------------------------------------- utilities
@@ -53,6 +54,13 @@ def rect_contains(rect, x, y, margin=0.0):
 
 def rect_intersects(a, b):
     return not (a.x1 < b.x0 or b.x1 < a.x0 or a.y1 < b.y0 or b.y1 < a.y0)
+
+
+def same_columns(a, b, tol=2.0):
+    """两个表格的列边界是否一致（跨页续表会沿用同一套列坐标）。"""
+    if not a.col_xs or len(a.col_xs) != len(b.col_xs):
+        return False
+    return all(abs(x - y) <= tol for x, y in zip(a.col_xs, b.col_xs))
 
 
 # ---------------------------------------------------------------- data model
@@ -99,6 +107,7 @@ class Element:
     bbox: Optional[pymupdf.Rect] = None
     lang: str = ""
     image: str = ""
+    col_xs: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- line extraction
@@ -140,8 +149,11 @@ def merge_v(segs):
     segs = sorted(segs)
     out = []
     for x, y0, y1 in segs:
-        if out and abs(out[-1][0] - x) < 0.8 and y0 <= out[-1][2] + 1.5:
-            out[-1] = (out[-1][0], out[-1][1], max(out[-1][2], y1))
+        # 同一 x 才可能是同一条线；同时要求 y 方向连续，
+        # 否则会把上下两个表格里 x 相近的竖线误并成一条
+        if (out and abs(out[-1][0] - x) < 0.8
+                and out[-1][1] - 1.5 <= y0 <= out[-1][2] + 1.5):
+            out[-1] = (out[-1][0], min(out[-1][1], y0), max(out[-1][2], y1))
         else:
             out.append((x, y0, y1))
     return out
@@ -151,8 +163,9 @@ def merge_h(segs):
     segs = sorted(segs)
     out = []
     for y, x0, x1 in segs:
-        if out and abs(out[-1][0] - y) < 0.8 and x0 <= out[-1][2] + 1.5:
-            out[-1] = (out[-1][0], out[-1][1], max(out[-1][2], x1))
+        if (out and abs(out[-1][0] - y) < 0.8
+                and out[-1][1] - 1.5 <= x0 <= out[-1][2] + 1.5):
+            out[-1] = (out[-1][0], min(out[-1][1], x0), max(out[-1][2], x1))
         else:
             out.append((y, x0, x1))
     return out
@@ -427,9 +440,9 @@ def extract_table(page, tab, lines):
             header = True
     if header:
         return {"header": rows[0], "rows": rows[1:], "ncols": ncols,
-                "bbox": tab["bbox"]}
+                "bbox": tab["bbox"], "xs": xs}
     return {"header": [""] * ncols, "rows": rows, "ncols": ncols,
-            "bbox": tab["bbox"]}
+            "bbox": tab["bbox"], "xs": xs}
 
 
 # ---------------------------------------------------------------- code blocks
@@ -549,11 +562,14 @@ def _quote_balance(s):
 # ---------------------------------------------------------------- main conversion
 
 class Converter:
-    def __init__(self, pdf_path, out_md, assets_dir, asset_prefix):
+    def __init__(self, pdf_path, out_md, assets_dir, asset_prefix,
+                 keep_source_image=None):
         self.doc = pymupdf.open(pdf_path)
         self.out_md = out_md
         self.assets_dir = assets_dir
         self.asset_prefix = asset_prefix
+        self.keep_source_image = (KEEP_SOURCE_IMAGE if keep_source_image is None
+                                  else keep_source_image)
         self.elements = []
         self.fig_count = 0
         self.heading_size_levels = self.compute_heading_levels()
@@ -597,10 +613,17 @@ class Converter:
             self.fig_count += 1
             path = os.path.join(self.assets_dir,
                                 f"{self.asset_prefix}_p{pno:03d}_fig{fi+1}.png")
-            pix = page.get_pixmap(clip=fr, dpi=300, alpha=False)
-            pix.save(path)
             # 先尝试把矢量图转成 Mermaid；失败时保留原图
             diagram = mermaid_diagram.convert_figure(page, fr, lines, drawings)
+            if diagram is not None and not self.keep_source_image:
+                # 只保留语义化结果，不落盘原图
+                page_elements.append(Element(
+                    kind="mermaid", page=pno, y=fr.y0, x=fr.x0,
+                    text=diagram.mermaid, bbox=fr,
+                    lang=diagram.kind, marker=",".join(diagram.warnings)))
+                continue
+            pix = page.get_pixmap(clip=fr, dpi=300, alpha=False)
+            pix.save(path)
             if diagram is not None:
                 page_elements.append(Element(
                     kind="mermaid", page=pno, y=fr.y0, x=fr.x0,
@@ -634,7 +657,7 @@ class Converter:
             page_elements.append(Element(
                 kind="table", page=pno, y=tab["bbox"].y0, x=tab["bbox"].x0,
                 rows=t["rows"], header=t["header"], ncols=t["ncols"],
-                bbox=tab["bbox"]))
+                bbox=tab["bbox"], col_xs=t["xs"]))
 
         # remaining lines
         rest = [ln for i, ln in enumerate(lines) if i not in consumed]
@@ -826,6 +849,8 @@ class Converter:
     def postprocess(self):
         # merge across page boundaries
         merged = []
+        # 记录每个表格最后一个片段的页码与底边，支持跨 3 页以上的续表
+        table_tail = {}
         for el in self.elements:
             if merged:
                 prev = merged[-1]
@@ -839,27 +864,43 @@ class Converter:
                     prev.lang = prev.lang or el.lang
                     continue
                 if (el.kind == "table" and prev.kind == "table" and
-                        prev.page == el.page - 1 and prev.bbox and el.bbox and
-                        prev.bbox.y1 > 730 and el.bbox.y0 < 85 and
-                        prev.ncols == el.ncols):
-                    if el.header and prev.header and el.header == prev.header:
-                        prev.rows.extend(el.rows)
-                    else:
-                        if el.header and any(c.strip() for c in el.header):
-                            prev.rows.append(el.header)
-                        prev.rows.extend(el.rows)
-                    prev.bbox = pymupdf.Rect(prev.bbox.x0, prev.bbox.y0,
-                                             max(prev.bbox.x1, el.bbox.x1),
-                                             max(prev.bbox.y1, el.bbox.y1))
-                    continue
+                        prev.bbox and el.bbox and prev.ncols == el.ncols and
+                        same_columns(prev, el)):
+                    prev_page, prev_bottom = table_tail.get(
+                        id(prev), (prev.page, prev.bbox.y1))
+                    if (el.page == prev_page + 1 and prev_bottom > 400
+                            and el.bbox.y0 < 85):
+                        if el.header and prev.header and el.header == prev.header:
+                            prev.rows.extend(el.rows)
+                        else:
+                            if el.header and any(c.strip() for c in el.header):
+                                prev.rows.append(el.header)
+                            prev.rows.extend(el.rows)
+                        prev.bbox = pymupdf.Rect(prev.bbox.x0, prev.bbox.y0,
+                                                 max(prev.bbox.x1, el.bbox.x1),
+                                                 max(prev.bbox.y1, el.bbox.y1))
+                        table_tail[id(prev)] = (el.page, el.bbox.y1)
+                        continue
                 if (el.kind == "paragraph" and prev.kind == "paragraph" and
                         prev.page == el.page - 1 and prev.y > 700 and el.y < 100):
                     last = prev.text.rstrip()
-                    if last and not re.search(r"[。！？；：]$", last):
-                        prev.text = prev.text.rstrip() + el.text.lstrip()
+                    head = el.text.lstrip()
+                    # 只拼接真正断句的中文段落；否则会把页尾 URL/字段名与下页标题粘在一起
+                    if (last and head and not re.search(r"[。！？；：]$", last)
+                            and re.search(r"[\u4e00-\u9fa5，、]$", last)
+                            and re.search(r"^[\u4e00-\u9fa5（(“\"《]", head)):
+                        prev.text = last + head
+                        # 更新到已合并片段的页码/位置，避免继续吞并后面的段落
+                        prev.page = el.page
+                        prev.y = el.y
                         continue
             merged.append(el)
         self.elements = merged
+
+        # 跨页续表会在页尾/页首留下全空的网格残行，统一丢弃
+        for el in self.elements:
+            if el.kind == "table":
+                el.rows = [r for r in el.rows if any(c.strip() for c in r)]
 
         # reflow code blocks
         for el in self.elements:
@@ -926,7 +967,7 @@ class Converter:
                 lines.append(el.text.rstrip())
                 lines.append("```")
                 lines.append("")
-                if KEEP_SOURCE_IMAGE:
+                if self.keep_source_image:
                     rel = os.path.relpath(el.image, os.path.dirname(self.out_md)).replace("\\", "/")
                     label = DIAGRAM_LABELS.get(el.lang, el.lang)
                     lines.append("<details>")
@@ -943,7 +984,90 @@ class Converter:
             f.write(text.strip() + "\n")
 
 
+def safe_prefix(stem):
+    """把文件名转成可安全用于图片名的前缀（保留 ASCII 部分）。"""
+    p = re.sub(r"[^0-9A-Za-z]+", "_", stem).strip("_").lower()
+    return p or "doc"
+
+
+def default_outputs(pdf_path):
+    """默认产出：<同名>.md、<同名>_assets/、ASCII 前缀，均与源文件同目录。"""
+    pdf_path = os.path.abspath(pdf_path)
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    out_dir = os.path.dirname(pdf_path)
+    return (os.path.join(out_dir, base + ".md"),
+            os.path.join(out_dir, base + "_assets"),
+            safe_prefix(base))
+
+
+def convert_document(pdf_path, out_md, assets_dir, asset_prefix,
+                     keep_source_image=None):
+    """转换入口（供 CLI / MCP 复用），返回产出统计。"""
+    os.makedirs(assets_dir, exist_ok=True)
+    conv = Converter(pdf_path, out_md, assets_dir, asset_prefix,
+                     keep_source_image=keep_source_image)
+    conv.run()
+    kinds = {}
+    for el in conv.elements:
+        kinds[el.kind] = kinds.get(el.kind, 0) + 1
+    pages = conv.doc.page_count
+    conv.doc.close()
+    # 没有图片产物时不留空目录
+    try:
+        if not os.listdir(assets_dir):
+            os.rmdir(assets_dir)
+    except OSError:
+        pass
+    return {
+        "pages": pages,
+        "tables": kinds.get("table", 0),
+        "mermaid": kinds.get("mermaid", 0),
+        "figures": kinds.get("figure", 0),
+        "headings": kinds.get("heading", 0),
+        "paragraphs": kinds.get("paragraph", 0),
+        "code_blocks": kinds.get("code", 0),
+        "md_bytes": os.path.getsize(out_md),
+    }
+
+
+def run_conversion(input_pdf, output_md="", assets_dir="", prefix="",
+                   clean_watermark_first=True, keep_source_image=False):
+    """去水印（按需）→ 转换，返回产出路径与统计。失败直接抛异常。
+
+    供 CLI / MCP / 库调用复用，避免三处重复编排。
+    """
+    pdf = os.path.abspath(os.path.expanduser(input_pdf))
+    if not os.path.isfile(pdf):
+        raise FileNotFoundError(f"PDF 不存在: {pdf}")
+
+    d_md, d_assets, d_prefix = default_outputs(pdf)
+    out_md = os.path.abspath(output_md) if output_md else d_md
+    assets = os.path.abspath(assets_dir) if assets_dir else d_assets
+    prefix = prefix or d_prefix
+    os.makedirs(os.path.dirname(out_md), exist_ok=True)
+
+    started = time.time()
+    removed = 0
+    work_dir = None
+    to_convert = pdf
+    if clean_watermark_first:
+        import clean_watermark
+        if clean_watermark.has_watermark(pdf):
+            work_dir = tempfile.mkdtemp(prefix="pdf2md_")
+            to_convert = os.path.join(work_dir, "clean.pdf")
+            removed = clean_watermark.remove_watermark(pdf, to_convert)
+    try:
+        stats = convert_document(to_convert, out_md, assets, prefix,
+                                 keep_source_image=keep_source_image)
+    finally:
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    return {"md": out_md, "assets": assets, "watermark_removed": removed,
+            "elapsed_ms": int((time.time() - started) * 1000), **stats}
+
+
 if __name__ == "__main__":
     pdf, out_md, assets, prefix = sys.argv[1:5]
-    os.makedirs(assets, exist_ok=True)
-    Converter(pdf, out_md, assets, prefix).run()
+    print(json.dumps(convert_document(pdf, out_md, assets, prefix),
+                     ensure_ascii=False))

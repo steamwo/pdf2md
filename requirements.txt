@@ -1,2 +1,4 @@
 pymupdf>=1.24
 pikepdf>=8.0
+# MCP 服务器（仅 mcp_server.py 需要；convert.py / clean_watermark.py 不依赖）
+mcp>=2.0

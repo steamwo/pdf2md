@@ -224,3 +224,13 @@ __marimo__/
 out*.md
 assets*/
 clean/
+
+# PyInstaller 产物
+build/
+dist/
+.sisyphus/
+
+# 打包配置需要纳入版本管理（覆盖上面的 *.spec）
+!pdf2md.spec
+
+.opencode
